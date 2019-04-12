@@ -36,6 +36,12 @@ interface
 
 {$I GR32.inc}
 
+{$define FONT_CACHE}
+
+{$ifdef FONT_CACHE}
+{$else FONT_CACHE}
+{$endif FONT_CACHE}
+
 uses
   Windows, Types, GR32, GR32_Paths, Math;
 
@@ -69,13 +75,14 @@ const
 implementation
 
 uses
+  Generics.Collections,
 {$IFDEF USESTACKALLOC}
   GR32_LowLevel,
 {$ENDIF}
   SysUtils;
 
 var
-  UseHinting: Boolean;
+  UseHinting: Boolean = False;
   HorzStretch: Integer; // stretching factor when calling GetGlyphOutline()
   HorzStretch_Inv: Single;
 
@@ -100,27 +107,242 @@ begin
 end;
 
 
+{$ifdef FONT_CACHE}
+type
+  TFontCacheItem = class;
+
+  TGlyphInfo = class
+  private
+    FFontCacheItem: TFontCacheItem;
+    FGlyph: integer;
+    FValid: boolean;
+    FGlyphMetrics: TGlyphMetrics;
+    FTTPolygonHeader: PTTPolygonHeader;
+    FTTPolygonHeaderSize: DWORD;
+    FHits: uint64;
+  public
+    constructor Create(AFontCacheItem: TFontCacheItem; ADC: HDC; AGlyph: integer);
+    destructor Destroy; override;
+
+    procedure Hit;
+
+    property Glyph: integer read FGlyph;
+    property Valid: boolean read FValid;
+
+    property GlyphMetrics: TGlyphMetrics read FGlyphMetrics;
+    property TTPolygonHeader: PTTPolygonHeader read FTTPolygonHeader;
+    property TTPolygonHeaderSize: DWORD read FTTPolygonHeaderSize;
+  end;
+
+  TFontCacheItem = class
+  private
+    FLogFont: TLogFont;
+    FTextMetric: TTextMetric;
+    FGlyphCache: TDictionary<integer, TGlyphInfo>;
+    FHits: uint64;
+  public
+    constructor Create(DC: HDC; const ALogFont: TLogFont);
+    destructor Destroy; override;
+
+    procedure Hit;
+
+    function GetGlyphInfo(DC: HDC; Glyph: integer): TGlyphInfo;
+
+    property TextMetric: TTextMetric read FTextMetric;
+  end;
+
+  TFontCache = class
+  private
+    FCache: TDictionary<TLogFont, TFontCacheItem>;
+  public
+    constructor Create;
+    destructor Destroy; override;
+
+    procedure Clear;
+
+    function GetItemByFont(DC: HDC; Font: HFont): TFontCacheItem;
+    function GetItemByDC(DC: HDC): TFontCacheItem;
+  end;
+
+var
+  FontCache: TFontCache;
+
+{ TGlyphInfo }
+
+constructor TGlyphInfo.Create(AFontCacheItem: TFontCacheItem; ADC: HDC; AGlyph: integer);
+begin
+  inherited Create;
+  FFontCacheItem := AFontCacheItem;
+  FGlyph := AGlyph;
+
+  FTTPolygonHeaderSize := GetGlyphOutline(ADC, FGlyph, GGODefaultFlags[UseHinting], FGlyphMetrics, 0, nil, VertFlip_mat2);
+
+  if (FTTPolygonHeaderSize <> 0) then
+  begin
+    GetMem(FTTPolygonHeader, FTTPolygonHeaderSize);
+    try
+      try
+        FTTPolygonHeaderSize := GetGlyphOutline(ADC, FGlyph, GGODefaultFlags[UseHinting], FGlyphMetrics, FTTPolygonHeaderSize, FTTPolygonHeader, VertFlip_mat2);
+
+        FValid := (FTTPolygonHeaderSize <> GDI_ERROR) and (FTTPolygonHeader^.dwType = TT_POLYGON_TYPE);
+
+      except
+        FValid := False;
+        raise;
+      end;
+    finally
+      if (not FValid) then
+      begin
+        FreeMem(FTTPolygonHeader);
+        FTTPolygonHeader := nil;
+      end;
+    end;
+  end else
+    FValid := False;
+end;
+
+destructor TGlyphInfo.Destroy;
+begin
+  if (FValid) then
+    FreeMem(FTTPolygonHeader);
+  inherited;
+end;
+
+procedure TGlyphInfo.Hit;
+begin
+  Inc(FHits);
+end;
+
+{ TFontCacheItem }
+
+constructor TFontCacheItem.Create(DC: HDC; const ALogFont: TLogFont);
+begin
+  inherited Create;
+  FGlyphCache := TObjectDictionary<integer, TGlyphInfo>.Create([doOwnsValues]);
+  FLogFont := ALogFont;
+  GetTextMetrics(DC, FTextMetric);
+end;
+
+destructor TFontCacheItem.Destroy;
+begin
+  FGlyphCache.Free;
+  inherited;
+end;
+
+function TFontCacheItem.GetGlyphInfo(DC: HDC; Glyph: integer): TGlyphInfo;
+begin
+  if (FGlyphCache.TryGetValue(Glyph, Result)) then
+  begin
+    Result.Hit;
+    exit;
+  end;
+
+  Result := TGlyphInfo.Create(Self, DC, Glyph);
+  FGlyphCache.Add(Glyph, Result);
+end;
+
+procedure TFontCacheItem.Hit;
+begin
+  Inc(FHits);
+end;
+
+{ TFontCache }
+
+procedure TFontCache.Clear;
+begin
+  FCache.Clear;
+end;
+
+constructor TFontCache.Create;
+begin
+  inherited Create;
+  FCache := TObjectDictionary<TLogFont, TFontCacheItem>.Create([doOwnsValues]);
+end;
+
+destructor TFontCache.Destroy;
+begin
+  FCache.Free;
+  inherited;
+end;
+
+function TFontCache.GetItemByFont(DC: HDC; Font: HFont): TFontCacheItem;
+var
+  LogFont: TLogFont;
+  Size: integer;
+  i: integer;
+  Clear: boolean;
+begin
+  FillChar(LogFont, SizeOf(TLogFont), 0);
+  Size := GetObject(Font, SizeOf(TLogFont), @LogFont);
+  if (Size <> SizeOf(TLogFont)) then
+    raise Exception.Create('Failed to retrieve LOGFONT');
+
+  // Clear junk
+  Clear := False;
+  for i := 0 to High(LogFont.lfFaceName) do
+  begin
+    if (Clear) then
+      LogFont.lfFaceName[i] := #0
+    else
+      Clear := (LogFont.lfFaceName[i] = #0);
+  end;
+
+  if (FCache.TryGetValue(LogFont, Result)) then
+  begin
+    Result.Hit;
+    exit;
+  end;
+
+  Result := TFontCacheItem.Create(DC, LogFont);
+  FCache.Add(LogFont, Result);
+end;
+
+
+function TFontCache.GetItemByDC(DC: HDC): TFontCacheItem;
+var
+  Font: HFONT;
+begin
+  Font := GetCurrentObject(DC, OBJ_FONT);
+  Result := GetItemByFont(DC, Font);
+end;
+{$endif FONT_CACHE}
+
+
 {$IFDEF USESTACKALLOC}
 {$W+}
 {$ENDIF}
+{$ifdef FONT_CACHE}
+function GlyphOutlineToPath(GlyphInfo: TGlyphInfo; Path: TCustomPath; DstX, MaxX, DstY: Single): Boolean;
+{$else FONT_CACHE}
 function GlyphOutlineToPath(Handle: HDC; Path: TCustomPath;
   DstX, MaxX, DstY: Single;
   const Glyph: Integer; out Metrics: TGlyphMetrics): Boolean;
+{$endif FONT_CACHE}
 var
   I, K, S: Integer;
   Res: DWORD;
+{$ifdef FONT_CACHE}
+  BufferPtr: PTTPolygonHeader;
+{$else FONT_CACHE}
   GlyphMemPtr, BufferPtr: PTTPolygonHeader;
+{$endif FONT_CACHE}
   CurvePtr: PTTPolyCurve;
   P1, P2, P3: TFloatPoint;
 begin
-  Result := False;
+{$ifdef FONT_CACHE}
+  Result := (GlyphInfo.Valid) and (DstX + GlyphInfo.GlyphMetrics.gmCellIncX <= MaxX);
+  if (not Result) or (Path = nil) then
+    Exit;
+  BufferPtr := GlyphInfo.TTPolygonHeader;
+  Res := GlyphInfo.TTPolygonHeaderSize;
+{$else FONT_CACHE}
+  Res := GetGlyphOutline(Handle, Glyph, GGODefaultFlags[UseHinting], Metrics, 0, nil, VertFlip_mat2);
+  if (Res = 0) then 
+    Exit(False);
 
-  Res := GetGlyphOutline(Handle, Glyph, GGODefaultFlags[UseHinting], Metrics,
-    0, nil, VertFlip_mat2);
-  if (Res = 0) then Exit;
-
-  Result := DstX + Metrics.gmCellIncX <= MaxX;
-  if not Result or not Assigned(Path) then Exit;
+  Result := (DstX + Metrics.gmCellIncX <= MaxX);
+  if (not Result) or (not Assigned(Path)) then 
+    Exit;
 
   {$IFDEF USESTACKALLOC}
   GlyphMemPtr := StackAlloc(Res);
@@ -129,8 +351,7 @@ begin
   {$ENDIF}
   BufferPtr := GlyphMemPtr;
 
-  Res := GetGlyphOutline(Handle, Glyph, GGODefaultFlags[UseHinting], Metrics,
-    Res, BufferPtr, VertFlip_mat2);
+  Res := GetGlyphOutline(Handle, Glyph, GGODefaultFlags[UseHinting], Metrics, Res, BufferPtr, VertFlip_mat2);
 
   if (Res = GDI_ERROR) or (BufferPtr^.dwType <> TT_POLYGON_TYPE) then
   begin
@@ -141,6 +362,7 @@ begin
     {$ENDIF}
     Exit;
   end;
+{$endif FONT_CACHE}
 
   // Batch each glyph so we're sure that the polygons are rendered as a whole (no pun...)
   // and not as individual independent polygons.
@@ -217,18 +439,20 @@ begin
     {$ENDIF}
   end;
 
+{$ifdef FONT_CACHE}
+{$else FONT_CACHE}
   {$IFDEF USESTACKALLOC}
   StackFree(GlyphMemPtr);
   {$ELSE}
   FreeMem(GlyphMemPtr);
   {$ENDIF}
+{$endif FONT_CACHE}
 
   Path.EndUpdate;
 end;
 {$IFDEF USESTACKALLOC}
 {$W-}
 {$ENDIF}
-
 
 procedure InternalTextToPath(DC: HDC; Path: TCustomPath; const ARect: TFloatRect; const Text: string; Flags: Cardinal = 0);
 const
@@ -462,6 +686,11 @@ var
     Result := (ARect.Right > ARect.Left) and (X > ARect.Right * HorzStretch);
   end;
 
+{$ifdef FONT_CACHE}
+var
+  FontCacheItem: TFontCacheItem;
+  GlyphInfo: TGlyphInfo;
+{$endif FONT_CACHE}
 begin
 {$IFDEF USEKERNING}
   KerningPairs := nil;
@@ -493,7 +722,13 @@ begin
   end else
     TextPath := nil;
 
+{$ifdef FONT_CACHE}
+  FontCacheItem := FontCache.GetItemByDC(DC);
+  TextMetric := FontCacheItem.TextMetric;
+{$else FONT_CACHE}
   GetTextMetrics(DC, TextMetric);
+{$endif FONT_CACHE}
+
   TextLen := Length(Text);
   X := ARect.Left * HorzStretch;
   Y := ARect.Top + TextMetric.tmAscent;
@@ -507,9 +742,13 @@ begin
   CharOffsets[0] := 0;
   SetLength(CharWidths, TextLen);
 
-  GetGlyphOutline(DC, CHAR_SP, GGODefaultFlags[UseHinting], GlyphMetrics,
-    0, nil, VertFlip_mat2);
+{$ifdef FONT_CACHE}
+  GlyphInfo := FontCacheItem.GetGlyphInfo(DC, CHAR_SP);
+  SpcX := GlyphInfo.GlyphMetrics.gmCellIncX;
+{$else FONT_CACHE}
+  GetGlyphOutline(DC, CHAR_SP, GGODefaultFlags[UseHinting], GlyphMetrics, 0, nil, VertFlip_mat2);
   SpcX := GlyphMetrics.gmCellIncX;
+{$endif FONT_CACHE}
 
   if (Flags and DT_SINGLELINE <> 0) or (ARect.Left = ARect.Right) then
   begin
@@ -566,9 +805,15 @@ begin
     end
     else
     begin
-      if GlyphOutlineToPath(DC, TextPath, X, MaxRight, Y, CharValue,
-        GlyphMetrics) then
+{$ifdef FONT_CACHE}
+      GlyphInfo := FontCacheItem.GetGlyphInfo(DC, CharValue);
+      if (GlyphInfo.Valid) and (GlyphOutlineToPath(GlyphInfo, TextPath, X, MaxRight, Y)) then
       begin
+        GlyphMetrics := GlyphInfo.GlyphMetrics;
+{$else FONT_CACHE}
+      if GlyphOutlineToPath(DC, TextPath, X, MaxRight, Y, CharValue, GlyphMetrics) then
+      begin
+{$endif FONT_CACHE}
         if Assigned(TextPath) then
         // Save path list offset of first path of current glyph
           CharOffsets[I] := Length(TextPath.Path);
@@ -584,8 +829,15 @@ begin
         // the current glyph doesn't fit so a word must be split since
         // it fills more than a whole line ...
         NewLine(I - 1);
-        if not GlyphOutlineToPath(DC, TextPath, X, MaxRight, Y, CharValue,
-          GlyphMetrics) then Break;
+{$ifdef FONT_CACHE}
+        GlyphInfo := FontCacheItem.GetGlyphInfo(DC, CharValue);
+        if (not GlyphInfo.Valid) or (not GlyphOutlineToPath(GlyphInfo, TextPath, X, MaxRight, Y)) then
+          break;
+        GlyphMetrics := GlyphInfo.GlyphMetrics;
+{$else FONT_CACHE}
+        if (not GlyphOutlineToPath(DC, TextPath, X, MaxRight, Y, CharValue, GlyphMetrics)) then
+          Break;
+{$endif FONT_CACHE}
         if Assigned(TextPath) then
           // Save path list offset of first path of current glyph
           CharOffsets[I] := Length(TextPath.Path);
@@ -595,7 +847,7 @@ begin
       X := X + GlyphMetrics.gmCellIncX;
       {$IFDEF USEKERNING}
       if i < TextLen then NextCharValue := Ord(Text[i + 1]);
-      for J := 0 to KerningPairCount - 1 do 
+      for J := 0 to KerningPairCount - 1 do
       begin
         if (KerningPairs^[J].wFirst = CharValue) and
           (KerningPairs^[J].wSecond = NextCharValue) then
@@ -703,22 +955,42 @@ begin
 end;
 
 procedure SetHinting(Value: TTextHinting);
+{$ifdef FONT_CACHE}
+var
+  OldHinting: TTextHinting;
+{$endif FONT_CACHE}
 begin
+{$ifdef FONT_CACHE}
+  OldHinting := GetHinting;
+{$endif FONT_CACHE}
+
   UseHinting := Value <> thNone;
+
   if (Value = thNoHorz) then
-    HorzStretch := 16 else
+    HorzStretch := 16
+  else
     HorzStretch := 1;
   HorzStretch_Inv := 1 / HorzStretch;
+
   FillChar(VertFlip_mat2, SizeOf(VertFlip_mat2), 0);
   VertFlip_mat2.eM11.value := HorzStretch;
   VertFlip_mat2.eM22.value := -1; //reversed Y axis
+
+{$ifdef FONT_CACHE}
+  if (FontCache <> nil) and (OldHinting <> GetHinting) then
+    FontCache.Clear;
+{$endif FONT_CACHE}
 end;
 
 function GetHinting: TTextHinting;
 begin
-  if HorzStretch <> 1 then Result := thNoHorz
-  else if UseHinting then Result := thHinting
-  else Result := thNone;
+  if HorzStretch <> 1 then
+    Result := thNoHorz
+  else
+  if UseHinting then
+    Result := thHinting
+  else
+    Result := thNone;
 end;
 
 procedure InitHinting;
@@ -736,5 +1008,12 @@ end;
 
 initialization
   InitHinting;
-
+{$ifdef FONT_CACHE}
+  FontCache := TFontCache.Create;
+{$endif FONT_CACHE}
+finalization
+{$ifdef FONT_CACHE}
+  FreeAndNil(FontCache);
+{$endif FONT_CACHE}
 end.
+
