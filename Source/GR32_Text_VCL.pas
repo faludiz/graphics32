@@ -75,7 +75,9 @@ const
 implementation
 
 uses
+{$ifdef FONT_CACHE}
   Generics.Collections,
+{$endif FONT_CACHE}
 {$IFDEF USESTACKALLOC}
   GR32_LowLevel,
 {$ENDIF}
@@ -108,8 +110,77 @@ end;
 
 
 {$ifdef FONT_CACHE}
+const
+  // Size of a single glyph is typicall 400-500 bytes
+  CacheMaxSize = 256*1024; // Max size of cached TrueType Polygon data
+  CacheMinPurge = 128*1024; // Default size to shrink to if entries need to be purged
+
+
+type
+  TDoubleLinked<T: class> = record
+    Prev: ^TDoubleLinked<T>; // From Head: Least recently used
+    Next: ^TDoubleLinked<T>; // From Head: Most recently used
+    Value: T;
+    procedure InitializeHead;
+    function IsEmpty: boolean; inline;
+    function IsHead: boolean; inline;
+    function IsFirst: boolean; inline;
+    function IsLast: boolean; inline;
+    procedure Unlink; inline;
+    procedure Add(var Link: TDoubleLinked<T>); inline;
+  end;
+
+procedure TDoubleLinked<T>.InitializeHead;
+begin
+  Value := nil;
+  Next := @Self;
+  Prev := @Self;
+end;
+
+function TDoubleLinked<T>.IsEmpty: boolean;
+begin
+  Result := (Prev = Next);
+end;
+
+function TDoubleLinked<T>.IsHead: boolean;
+begin
+  // Head is just an item that holds the pointer to the first and last entries
+  // and connects them to form a circular list.
+  Result := (Value = nil);
+end;
+
+function TDoubleLinked<T>.IsFirst: boolean;
+begin
+  Result := (Prev <> nil) and (Prev.IsHead);
+end;
+
+function TDoubleLinked<T>.IsLast: boolean;
+begin
+  Result := (Next <> nil) and (Next.IsHead);
+end;
+
+procedure TDoubleLinked<T>.Unlink;
+begin
+  if (Prev <> nil) then
+    Prev.Next := Next;
+  if (Next <> nil) then
+    Next.Prev := Prev;
+  Prev := nil;
+  Next := nil;
+end;
+
+procedure TDoubleLinked<T>.Add(var Link: TDoubleLinked<T>);
+begin
+  Link.Next := Next;
+  Link.Prev := @Self;
+
+  Next.Prev := @Link;
+  Next := @Link;
+end;
+
 type
   TFontCacheItem = class;
+  TFontCache = class;
 
   TGlyphInfo = class
   private
@@ -120,11 +191,13 @@ type
     FTTPolygonHeader: PTTPolygonHeader;
     FTTPolygonHeaderSize: DWORD;
     FHits: uint64;
+    FLRUlink: TDoubleLinked<TGlyphInfo>;
+  protected
+    property LRUlink: TDoubleLinked<TGlyphInfo> read FLRUlink;
+    procedure Hit; // Register a cache hit
   public
     constructor Create(AFontCacheItem: TFontCacheItem; ADC: HDC; AGlyph: integer);
     destructor Destroy; override;
-
-    procedure Hit;
 
     property Glyph: integer read FGlyph;
     property Valid: boolean read FValid;
@@ -136,15 +209,18 @@ type
 
   TFontCacheItem = class
   private
+    FFontCache: TFontCache;
     FLogFont: TLogFont;
     FTextMetric: TTextMetric;
     FGlyphCache: TDictionary<integer, TGlyphInfo>;
     FHits: uint64;
+  protected
+    procedure Hit; // Register a cache hit
+    procedure ReserveCacheSpace(Size: uint64);
+    procedure UnreserveCacheSpace(Size: uint64);
   public
-    constructor Create(DC: HDC; const ALogFont: TLogFont);
+    constructor Create(AFontCache: TFontCache; DC: HDC; const ALogFont: TLogFont);
     destructor Destroy; override;
-
-    procedure Hit;
 
     function GetGlyphInfo(DC: HDC; Glyph: integer): TGlyphInfo;
 
@@ -154,18 +230,37 @@ type
   TFontCache = class
   private
     FCache: TDictionary<TLogFont, TFontCacheItem>;
+    FLRUList: TDoubleLinked<TGlyphInfo>;
+    FCacheHits: uint64;
+    FCacheMisses: uint64;
+    FCachePurges: uint64;
+    FCacheSize: uint64;
+    FCacheCount: uint64;
+    FCacheMaxSize: uint64;
+    FCacheMinPurge: uint64;
+  protected
+    property LRUList: TDoubleLinked<TGlyphInfo> read FLRUList;
+    procedure AddCacheItem(GlyphInfo: TGlyphInfo);
+    procedure RegisterCacheHit(GlyphInfo: TGlyphInfo);
+    procedure RegisterCacheMiss;
+    procedure RegisterCachePurge;
+    procedure ReserveCacheSpace(Size: uint64);
+    procedure UnreserveCacheSpace(Size: uint64);
   public
-    constructor Create;
+    constructor Create(AMaxSize: uint64 = CacheMaxSize; AMinPurge: uint64 = CacheMinPurge);
     destructor Destroy; override;
 
     procedure Clear;
 
     function GetItemByFont(DC: HDC; Font: HFont): TFontCacheItem;
     function GetItemByDC(DC: HDC): TFontCacheItem;
+
+    property CacheSize: uint64 read FCacheSize;
+    property CacheCount: uint64 read FCacheCount;
   end;
 
 var
-  FontCache: TFontCache;
+  FontCache: TFontCache = nil;
 
 { TGlyphInfo }
 
@@ -174,11 +269,14 @@ begin
   inherited Create;
   FFontCacheItem := AFontCacheItem;
   FGlyph := AGlyph;
+  FLRUlink.Value := Self;
 
   FTTPolygonHeaderSize := GetGlyphOutline(ADC, FGlyph, GGODefaultFlags[UseHinting], FGlyphMetrics, 0, nil, VertFlip_mat2);
 
   if (FTTPolygonHeaderSize <> 0) then
   begin
+    FFontCacheItem.ReserveCacheSpace(FTTPolygonHeaderSize);
+
     GetMem(FTTPolygonHeader, FTTPolygonHeaderSize);
     try
       try
@@ -203,8 +301,13 @@ end;
 
 destructor TGlyphInfo.Destroy;
 begin
+  FLRUlink.Unlink;
   if (FValid) then
     FreeMem(FTTPolygonHeader);
+
+  FFontCacheItem.UnreserveCacheSpace(TTPolygonHeaderSize);
+  FFontCacheItem.FGlyphCache.ExtractPair(Glyph);
+
   inherited;
 end;
 
@@ -215,9 +318,10 @@ end;
 
 { TFontCacheItem }
 
-constructor TFontCacheItem.Create(DC: HDC; const ALogFont: TLogFont);
+constructor TFontCacheItem.Create(AFontCache: TFontCache; DC: HDC; const ALogFont: TLogFont);
 begin
   inherited Create;
+  FFontCache := AFontCache;
   FGlyphCache := TObjectDictionary<integer, TGlyphInfo>.Create([doOwnsValues]);
   FLogFont := ALogFont;
   GetTextMetrics(DC, FTextMetric);
@@ -225,6 +329,7 @@ end;
 
 destructor TFontCacheItem.Destroy;
 begin
+  FGlyphCache.Clear;
   FGlyphCache.Free;
   inherited;
 end;
@@ -233,17 +338,28 @@ function TFontCacheItem.GetGlyphInfo(DC: HDC; Glyph: integer): TGlyphInfo;
 begin
   if (FGlyphCache.TryGetValue(Glyph, Result)) then
   begin
-    Result.Hit;
+    FFontCache.RegisterCacheHit(Result);
     exit;
   end;
 
   Result := TGlyphInfo.Create(Self, DC, Glyph);
   FGlyphCache.Add(Glyph, Result);
+  FFontCache.AddCacheItem(Result);
 end;
 
 procedure TFontCacheItem.Hit;
 begin
   Inc(FHits);
+end;
+
+procedure TFontCacheItem.ReserveCacheSpace(Size: uint64);
+begin
+  FFontCache.ReserveCacheSpace(Size);
+end;
+
+procedure TFontCacheItem.UnreserveCacheSpace(Size: uint64);
+begin
+  FFontCache.UnreserveCacheSpace(Size);
 end;
 
 { TFontCache }
@@ -253,10 +369,14 @@ begin
   FCache.Clear;
 end;
 
-constructor TFontCache.Create;
+constructor TFontCache.Create(AMaxSize: uint64 = CacheMaxSize; AMinPurge: uint64 = CacheMinPurge);
 begin
+  Assert(AMaxSize > AMinPurge);
   inherited Create;
+  FCacheMaxSize := AMaxSize;
+  FCacheMinPurge := AMinPurge;
   FCache := TObjectDictionary<TLogFont, TFontCacheItem>.Create([doOwnsValues]);
+  FLRUList.InitializeHead;
 end;
 
 destructor TFontCache.Destroy;
@@ -293,10 +413,59 @@ begin
     exit;
   end;
 
-  Result := TFontCacheItem.Create(DC, LogFont);
+  Result := TFontCacheItem.Create(Self, DC, LogFont);
   FCache.Add(LogFont, Result);
 end;
 
+procedure TFontCache.AddCacheItem(GlyphInfo: TGlyphInfo);
+begin
+  // Insert item at start of LRU list
+  FLRUList.Add(GlyphInfo.FLRUlink);
+end;
+
+procedure TFontCache.RegisterCacheHit(GlyphInfo: TGlyphInfo);
+begin
+  GlyphInfo.Hit;
+  Inc(FCacheHits);
+
+  // Move item to start of LRU list unless it's already there
+  if (not GlyphInfo.LRUlink.IsFirst) then
+  begin
+    GlyphInfo.LRUlink.Unlink;
+    FLRUList.Add(GlyphInfo.FLRUlink);
+  end;
+end;
+
+procedure TFontCache.RegisterCacheMiss;
+begin
+  Inc(FCacheMisses);
+end;
+
+procedure TFontCache.RegisterCachePurge;
+begin
+  Inc(FCachePurges);
+end;
+
+procedure TFontCache.ReserveCacheSpace(Size: uint64);
+begin
+  Inc(FCacheCount);
+  Inc(FCacheSize, Size);
+
+  // Make sure there's room for the new item in the cache
+  if (FCacheSize <= FCacheMaxSize) then
+    exit;
+
+  // Purge items from cache until total size has reached threshold
+  while (FCacheSize > FCacheMinPurge) and (not FLRUList.IsEmpty) do
+    FLRUList.Prev.Value.Free;
+end;
+
+procedure TFontCache.UnreserveCacheSpace(Size: uint64);
+begin
+  Dec(FCacheCount);
+  Dec(FCacheSize, Size);
+  Assert(FCacheSize >= 0);
+end;
 
 function TFontCache.GetItemByDC(DC: HDC): TFontCacheItem;
 var
