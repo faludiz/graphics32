@@ -122,10 +122,10 @@ type
     Next: ^TDoubleLinked<T>; // From Head: Most recently used
     Value: T;
     procedure InitializeHead;
-    function IsEmpty: boolean; inline;
-    function IsHead: boolean; inline;
-    function IsFirst: boolean; inline;
-    function IsLast: boolean; inline;
+    function IsEmpty: boolean; inline; // Does not have a value
+    function IsHead: boolean; inline; // Is the empty head node
+    function IsMRU: boolean; inline; // Is Most Recently Used
+    function IsLRU: boolean; inline; // Is Least Recently Used
     procedure Unlink; inline;
     procedure Add(var Link: TDoubleLinked<T>); inline;
   end;
@@ -149,12 +149,12 @@ begin
   Result := (Value = nil);
 end;
 
-function TDoubleLinked<T>.IsFirst: boolean;
+function TDoubleLinked<T>.IsMRU: boolean;
 begin
   Result := (Prev <> nil) and (Prev.IsHead);
 end;
 
-function TDoubleLinked<T>.IsLast: boolean;
+function TDoubleLinked<T>.IsLRU: boolean;
 begin
   Result := (Next <> nil) and (Next.IsHead);
 end;
@@ -428,8 +428,8 @@ begin
   GlyphInfo.Hit;
   Inc(FCacheHits);
 
-  // Move item to start of LRU list unless it's already there
-  if (not GlyphInfo.LRUlink.IsFirst) then
+  // Make item the MRU
+  if (not GlyphInfo.LRUlink.IsMRU) then
   begin
     GlyphInfo.LRUlink.Unlink;
     FLRUList.Add(GlyphInfo.FLRUlink);
@@ -455,7 +455,7 @@ begin
   if (FCacheSize <= FCacheMaxSize) then
     exit;
 
-  // Purge items from cache until total size has reached threshold
+  // Purge LRU items from cache until total size has reached threshold
   while (FCacheSize > FCacheMinPurge) and (not FLRUList.IsEmpty) do
     FLRUList.Prev.Value.Free;
 end;
