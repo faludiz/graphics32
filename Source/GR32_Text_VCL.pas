@@ -113,7 +113,7 @@ end;
 const
   // Size of a single glyph is typicall 400-500 bytes
   CacheMaxSize = 256*1024; // Max size of cached TrueType Polygon data
-  CacheMinPurge = 128*1024; // Default size to shrink to if entries need to be purged
+  CacheMinPurge = 256*1024; // Default size to shrink below if entries need to be purged (must be less or equal to CacheMaxSize)
 
 
 type
@@ -371,7 +371,7 @@ end;
 
 constructor TFontCache.Create(AMaxSize: uint64 = CacheMaxSize; AMinPurge: uint64 = CacheMinPurge);
 begin
-  Assert(AMaxSize > AMinPurge);
+  Assert(AMaxSize >= AMinPurge);
   inherited Create;
   FCacheMaxSize := AMaxSize;
   FCacheMinPurge := AMinPurge;
@@ -456,7 +456,7 @@ begin
     exit;
 
   // Purge LRU items from cache until total size has reached threshold
-  while (FCacheSize > FCacheMinPurge) and (not FLRUList.IsEmpty) do
+  while (FCacheSize >= FCacheMinPurge) and (not FLRUList.IsEmpty) do
     FLRUList.Prev.Value.Free;
 end;
 
