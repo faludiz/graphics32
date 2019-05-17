@@ -111,7 +111,7 @@ end;
 
 {$ifdef FONT_CACHE}
 const
-  // Size of a single glyph is typicall 400-500 bytes
+  // Size of a single glyph is typically 400-500 bytes
   CacheMaxSize = 256*1024; // Max size of cached TrueType Polygon data
   CacheMinPurge = 256*1024; // Default size to shrink below if entries need to be purged (must be less or equal to CacheMaxSize)
 
@@ -837,16 +837,32 @@ var
     SpcCount := 0;
   end;
 
+{$ifdef FONT_CACHE}
+  function MeasureTextX(FontCacheItem: TFontCacheItem; const S: string): Integer;
+{$else FONT_CACHE}
   function MeasureTextX(const S: string): Integer;
+{$endif FONT_CACHE}
   var
     I: Integer;
+    CharValue: Integer;
+{$ifdef FONT_CACHE}
+    GlyphInfo: TGlyphInfo;
+{$endif FONT_CACHE}
   begin
     Result := 0;
     for I := 1 to Length(S) do
     begin
       CharValue := Ord(S[I]);
-      GetGlyphOutline(DC, CharValue, GGODefaultFlags[UseHinting], GlyphMetrics, 0, nil, VertFlip_mat2);
+
+{$ifdef FONT_CACHE}
+      GlyphInfo := FontCacheItem.GetGlyphInfo(DC, CharValue);
+      if (GlyphInfo.Valid) then
+        Inc(Result, GlyphInfo.GlyphMetrics.gmCellIncX);
+{$else FONT_CACHE}
+      GetGlyphOutline(DC, CharValue,
+        GGODefaultFlags[UseHinting], GlyphMetrics, 0, nil, VertFlip_mat2);
       Inc(Result, GlyphMetrics.gmCellIncX);
+{$endif FONT_CACHE}
     end;
   end;
 
@@ -959,7 +975,11 @@ begin
                 ([Ord(Text[J])] * [CHAR_CR, CHAR_NL, CHAR_SP] = []) do
                   Inc(J);
               S := Copy(Text, I, J - I);
+{$ifdef FONT_CACHE}
+              if NeedsNewLine(X + MeasureTextX(FontCacheItem, S)) then
+{$else FONT_CACHE}
               if NeedsNewLine(X + MeasureTextX(S)) then
+{$endif FONT_CACHE}
                 NewLine(I) else
                 AddSpace;
             end else
